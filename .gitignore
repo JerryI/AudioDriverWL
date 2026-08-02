@@ -1,0 +1,5 @@
+.DS_Store
+vendor/miniaudio.h
+vendor/miniaudio.h.download
+*.paclet
+build/
