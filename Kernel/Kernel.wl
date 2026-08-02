@@ -15,7 +15,7 @@ DeviceFramework`Devices`Microphone::command =
 
 Begin["`Private`"];
 
-$driverRoot = DirectoryName[ExpandFileName[$InputFileName]];
+$driverRoot = DirectoryName[ExpandFileName[$InputFileName]]//ParentDirectory;
 $nativeLoaded = False;
 $nativeLibrary = None;
 

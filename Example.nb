@@ -1,0 +1,6 @@
+Notebook[{Cell["PacletDirectoryLoad[NotebookDirectory[]]; ", "Input"], 
+  Cell["Open the device", "Text"], Cell["dev = DeviceOpen[\"Microphone\"]", 
+   "Input"], Cell["Read audio", "Text"], Cell["DeviceRead[dev]", "Input"], 
+  Cell["Read numeric array", "Text"], Cell["DeviceReadBuffer[dev]", "Input"], 
+  Cell["Live refresh (FT)", "Text"], Cell["Close device", "Text"], 
+  Cell["DeviceClose[dev]", "Input"]}]
