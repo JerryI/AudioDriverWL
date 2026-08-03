@@ -35,23 +35,25 @@ compileOptions = Switch[$OperatingSystem,
 ];
 extraLibraries = If[$SystemID === "Linux-ARM", {"atomic"}, {}];
 
-library = Check[
-  CCompilerDriver`CreateLibrary[
-    {FileNameJoin[{root, "native", "microphone.c"}]},
-    "microphone",
-    "TargetDirectory" -> targetDirectory,
-    "IncludeDirectories" -> {vendorDirectory},
-    "CompileOptions" -> compileOptions,
-    "Libraries" -> extraLibraries,
-    "CleanIntermediate" -> True
-  ],
-  $Failed
+libraries = Table[
+  library = Check[
+    CCompilerDriver`CreateLibrary[
+      {FileNameJoin[{root, "native", name <> ".c"}]},
+      name,
+      "TargetDirectory" -> targetDirectory,
+      "IncludeDirectories" -> {vendorDirectory},
+      "CompileOptions" -> compileOptions,
+      "Libraries" -> extraLibraries,
+      "CleanIntermediate" -> True
+    ],
+    $Failed
+  ];
+  If[library === $Failed || !FileExistsQ[library],
+    Print["Native library build failed for ", name, "."];
+    Exit[4]
+  ];
+  Print["Built ", library];
+  library,
+  {name, {"microphone", "speaker"}}
 ];
-
-If[library === $Failed || !FileExistsQ[library],
-  Print["Native library build failed."];
-  Exit[4]
-];
-
-Print["Built ", library];
 Exit[0];

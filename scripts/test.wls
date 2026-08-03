@@ -7,8 +7,8 @@ check[name_, condition_] := If[TrueQ[condition],
 ];
 
 PacletDirectoryLoad[root];
-check["driver discovery",
-  Length[DeviceFramework`FindDeviceDrivers["Microphone"]] >= 1
+check["microphone driver registration",
+  NumericQ[DeviceFramework`DeviceDriverVersion["Microphone"]]
 ];
 
 device = Quiet[Check[DeviceOpen["Microphone"], $Failed]];
@@ -41,10 +41,46 @@ If[Head[device] === DeviceObject,
   check["close", !DeviceOpenQ[device]];
 ];
 
+check["speaker driver registration",
+  NumericQ[DeviceFramework`DeviceDriverVersion["Speaker"]]
+];
+
+speaker = Quiet[Check[DeviceOpen["Speaker"], $Failed]];
+check["open default output", Head[speaker] === DeviceObject];
+
+If[Head[speaker] === DeviceObject,
+  speakerInfo = DeviceExecute[speaker, "Information"];
+  check["speaker information association", AssociationQ[speakerInfo]];
+  check["speaker sample rate", IntegerQ[speakerInfo["SampleRate"]] && speakerInfo["SampleRate"] > 0];
+  check["speaker channel count", IntegerQ[speakerInfo["Channels"]] && speakerInfo["Channels"] > 0];
+  check["speaker backend name", StringQ[speakerInfo["Backend"]] && StringLength[speakerInfo["Backend"]] > 0];
+
+  check["speaker stop", DeviceExecute[speaker, "Stop"] === "Stopped"];
+  check["speaker clear", DeviceExecute[speaker, "ClearBuffer"] === 0];
+
+  rawOutput = NumericArray[ConstantArray[0., {256, 1}], "Real32"];
+  DeviceWriteBuffer[speaker, rawOutput];
+  check["raw output queued", speaker["QueuedFrames"] === 256];
+  check["raw mono channel conversion", speaker["FreeFrames"] ===
+    speaker["BufferCapacityFrames"] - 256];
+
+  DeviceExecute[speaker, "ClearBuffer"];
+  silentAudio = Audio[ConstantArray[0., {1, 128}], SampleRate -> speaker["SampleRate"]];
+  DeviceWrite[speaker, silentAudio];
+  check["Audio output queued", speaker["QueuedFrames"] === 128];
+
+  DeviceConfigure[speaker, {"BufferDuration" -> .1, "PeriodSize" -> Automatic}];
+  check["speaker configuration", Abs[speaker["BufferDuration"] - .1] < .001];
+  check["speaker reset statistics", DeviceExecute[speaker, "ResetStatistics"] === 0];
+  check["speaker start", DeviceExecute[speaker, "Start"] === "Running"];
+
+  DeviceClose[speaker];
+  check["speaker close", !DeviceOpenQ[speaker]];
+];
+
 If[failures === {},
-  Print["All microphone integration checks passed."];
+  Print["All audio device integration checks passed."];
   Exit[0],
   Print["Failed checks: ", failures];
   Exit[1]
 ];
-

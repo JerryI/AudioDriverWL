@@ -1,7 +1,9 @@
-# Wolfram Device Framework microphone driver
+# Wolfram Device Framework audio drivers
 
-This paclet exposes the operating system's default audio input as a Wolfram
-Device Framework device:
+This paclet exposes the operating system's default audio input and output as
+Wolfram Device Framework devices.
+
+## Microphone
 
 ```wl
 PacletDirectoryLoad["path_to_this_repo_folder"];
@@ -21,6 +23,70 @@ Acquisition is callback-driven. The OS audio callback writes `float32` frames
 to a lock-free single-producer/single-consumer ring buffer. A Wolfram Language
 read only copies frames that are already available; there is no polling thread
 and no float-to-double expansion on the raw read path.
+
+## Speaker
+
+Open the default system output and write either an `Audio` object or raw
+sample frames:
+
+```wl
+speaker = DeviceOpen["Speaker"];
+
+DeviceWrite[speaker, Audio[Sin[2 Pi 440 Range[0, 4799]/48000],
+  SampleRate -> 48000]];
+
+raw = NumericArray[ConstantArray[0., {1024, 1}], "Real32"];
+DeviceWriteBuffer[speaker, raw];
+
+DeviceClose[speaker];
+```
+
+`DeviceWrite` resamples `Audio` to the open speaker's sample rate when needed.
+`DeviceWriteBuffer` accepts a numeric vector (mono) or a
+`frames x channels` numeric matrix. Mono frames are duplicated for a
+multichannel speaker, and multichannel frames are averaged when the speaker
+is configured for mono. Raw buffers have no sample-rate metadata, so their
+frames are always interpreted at `speaker["SampleRate"]`.
+
+Playback is callback-driven and nonblocking. Writes enqueue `float32` frames
+in a single-producer/single-consumer ring buffer, and the system output
+callback drains that buffer. If a write is larger than the currently free
+space, its excess frames are discarded. Queue diagnostics are available as:
+
+```wl
+speaker["BufferCapacityFrames"]
+speaker["QueuedFrames"]
+speaker["FreeFrames"]
+speaker["DroppedFrames"]
+speaker["UnderrunFrames"]
+
+DeviceExecute[speaker, "ClearBuffer"]
+DeviceExecute[speaker, "ResetStatistics"]
+DeviceExecute[speaker, "Stop"]
+DeviceExecute[speaker, "Start"]
+```
+
+For a low-latency microphone-to-speaker stream, open both devices with the
+microphone's negotiated format and move each available raw block directly:
+
+```wl
+microphone = DeviceOpen["Microphone"];
+speaker = DeviceOpen["Speaker", <|
+  "SampleRate" -> microphone["SampleRate"],
+  "Channels" -> microphone["Channels"],
+  "BufferDuration" -> .25
+|>];
+
+While[DeviceOpenQ[microphone] && DeviceOpenQ[speaker],
+  block = DeviceReadBuffer[microphone, 1024];
+  If[block =!= {}, DeviceWriteBuffer[speaker, block]];
+  Pause[.005]
+];
+```
+
+Use headphones for this example; an open microphone and nearby loudspeakers
+can create acoustic feedback. For continuous streaming, keep each block below
+`speaker["FreeFrames"]` or monitor `"DroppedFrames"`.
 
 ## Prebuild binaries
 ⚠️ We need some time to collect binaries for all machines
@@ -68,10 +134,12 @@ The configurable properties are:
 | `"PerformanceProfile"` | `"LowLatency"` or `"Conservative"` | `"LowLatency"` |
 
 `Automatic` lets the backend use the native format and avoids resampling or
-channel conversion where possible. A requested non-native format is converted
-by the native backend or miniaudio before it reaches the ring buffer.
+channel conversion where possible. When a non-native format is requested, the
+ring buffer uses that requested format and miniaudio converts between it and
+the hardware format.
 
-The same configurable properties can be assigned through the device object,
+The same configurable properties apply to both device classes and can be
+assigned through the device object,
 for example `dev["BufferDuration"] = .25`. `DeviceConfigure` is preferable when
 changing several properties because it performs a single restart.
 
@@ -167,5 +235,6 @@ After building, run the live smoke test:
 wolframscript -file "/absolute/path/to/AudioDriver/scripts/test.wls"
 ```
 
-The test opens the actual default input, verifies discovery and dynamic
-properties, captures a `Real32` buffer, reconfigures the stream, and closes it.
+The test opens the actual default input and output, verifies registration and
+dynamic properties, exercises `Audio` and `Real32` output writes, captures an
+input buffer, reconfigures both streams, and closes them.
