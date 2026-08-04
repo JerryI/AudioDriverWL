@@ -68,29 +68,38 @@ DeviceExecute[speaker, "Start"]
 
 ### Synchronous live echo
 
-For a low-latency synchronous microphone-to-speaker stream, open both devices
-with the microphone's negotiated format and move each available raw block
-directly. The short `Pause[0.005]` avoids a CPU-intensive tight loop:
+For a synchronous microphone-to-speaker stream, open both devices at the same
+sample rate and move each available raw block directly. The Wolfram kernel is
+not a hard-real-time audio thread, so start playback only after building a
+small jitter reserve. The short `Pause[0.005]` avoids a CPU-intensive tight
+loop:
 
 ```wl
 microphone = DeviceOpen["Microphone"];
 speaker = DeviceOpen["Speaker", <|
   "SampleRate" -> microphone["SampleRate"],
-  "Channels" -> microphone["Channels"],
   "BufferDuration" -> .25
 |>];
+
+DeviceExecute[speaker, "ClearBuffer"];
+DeviceExecute[microphone, "ClearBuffer"];
 
 While[True,
   block = DeviceReadBuffer[microphone, 1024];
   If[block === $Failed, Break[]];
-  If[block =!= {} && DeviceWriteBuffer[speaker, block] === $Failed, Break[]];
+  If[block =!= {},
+    If[DeviceWriteBuffer[speaker, block] === $Failed, Break[]];
+  ];
   Pause[0.005]
 ];
 ```
 
 Use headphones for this example; an open microphone and nearby loudspeakers
-can create acoustic feedback. For continuous streaming, keep each block below
-`speaker["FreeFrames"]` or monitor `"DroppedFrames"`.
+can create acoustic feedback. The `.1` second reserve tolerates ordinary kernel
+scheduling pauses at the cost of roughly 100 ms of added latency; reduce it only
+if the workload can reliably keep the speaker queue nonempty. For continuous
+streaming, keep each block below `speaker["FreeFrames"]` and monitor
+`"DroppedFrames"`.
 
 ### Asynchronous live echo
 
@@ -103,9 +112,12 @@ scheduled polling task:
 processBlock[_, "BufferReady", {availableFrames_}] := Module[{block},
   block = DeviceReadBuffer[microphone, Min[availableFrames, 256]];
   If[block =!= $Failed && block =!= {},
-    DeviceWriteBuffer[speaker, block]
+    DeviceWriteBuffer[speaker, block];
   ]
 ];
+
+DeviceExecute[speaker, "ClearBuffer"];
+DeviceExecute[microphone, "ClearBuffer"];
 
 task = DeviceExecuteAsynchronous[
   microphone,
@@ -238,6 +250,12 @@ On macOS and Windows, the first open may trigger the operating system's
 microphone permission prompt. Headless sessions must be granted access to the
 actual kernel host executable (`wolframscript`, Wolfram Engine, or Mathematica).
 
+On macOS, capture runs in a small bundled helper process while the ring buffer
+and Device Framework API remain in the Wolfram kernel. This avoids host-process
+Core Audio attenuation observed with some USB interfaces (including iRig HD 2)
+in embedded frontends such as WLJS. The Wolfram Language interface is unchanged
+and no external runtime dependency is required.
+
 ## Build
 
 Requirements are Wolfram Language 12 or newer and a platform C compiler:
@@ -253,11 +271,12 @@ its own location, which avoids shell and sandbox working-directory issues:
 wolframscript -file "/absolute/path/to/AudioDriver/scripts/build.wls"
 ```
 
-The script downloads the pinned miniaudio 0.11.25 header, verifies its SHA-256,
-and puts the native result in `LibraryResources/$SystemID/`. The dependency has
-no required development packages. On Linux, a running system audio service and
-its runtime libraries (usually PipeWire/PulseAudio or ALSA) must still be
-available.
+The script downloads the pinned miniaudio 0.11.25 header, verifies its upstream
+SHA-256, applies a checked Core Audio compatibility fix for padded 16-bit USB
+formats, verifies the patched SHA-256, and puts the native libraries and macOS
+capture helper in `LibraryResources/$SystemID/`. The dependency has no required
+development packages. On Linux, a running system audio service and its runtime
+libraries (usually PipeWire/PulseAudio or ALSA) must still be available.
 
 For development, load the directory without copying it:
 

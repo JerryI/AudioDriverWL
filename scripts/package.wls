@@ -3,7 +3,9 @@ target = FileNameJoin[{root, "build"}];
 libraryDirectory = FileNameJoin[{root, "LibraryResources", $SystemID}];
 
 If[!DirectoryQ[libraryDirectory] ||
-   AnyTrue[{"microphone", "speaker"}, FileNames[# <> ".*", libraryDirectory] === {} &],
+   AnyTrue[{"microphone", "speaker"}, FileNames[# <> ".*", libraryDirectory] === {} &] ||
+   ($OperatingSystem === "MacOSX" &&
+    !FileExistsQ[FileNameJoin[{libraryDirectory, "microphone_helper"}]]),
   Print["One or more native audio libraries are missing for ", $SystemID,
     ". Run scripts/build.wls first."];
   Exit[2]

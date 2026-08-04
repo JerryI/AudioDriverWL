@@ -11,6 +11,12 @@ Type: Input
 PacletDirectoryLoad[NotebookDirectory[]];
 
 %-------------------------------------------------------------------------%
+Display: print
+Type: Output
+%-------------------------------------------------------------------------%
+>> "Promise >> Timeout!"
+
+%-------------------------------------------------------------------------%
 Props:
   Hidden: true
 Type: Input
@@ -29,7 +35,7 @@ Open the device
 %-------------------------------------------------------------------------%
 Type: Input
 %-------------------------------------------------------------------------%
-dev = DeviceOpen["Microphone"]
+dev = DeviceOpen["Microphone"];
 
 %-------------------------------------------------------------------------%
 Props:
@@ -88,7 +94,7 @@ Type: Input
 %-------------------------------------------------------------------------%
 Refresh[
   ListLinePlot[Take[Abs@Fourier[DeviceReadBuffer[dev, 4000][[All,1]]//Normal], 200], PlotRange->Full], 
-  0.01
+  1/45.0
 ]
 
 %-------------------------------------------------------------------------%
@@ -138,17 +144,22 @@ Type: Input
 microphone = DeviceOpen["Microphone", <|"Channels"->1|>];
 speaker = DeviceOpen["Speaker", <|
   "SampleRate" -> microphone["SampleRate"],
-  "Channels" -> microphone["Channels"],
   "BufferDuration" -> .25
 |>];
 
-DeviceExecute[speaker, "ClearBuffer"]
-DeviceExecute[microphone, "ClearBuffer"]
+DeviceExecute[speaker, "ClearBuffer"];
+DeviceExecute[microphone, "ClearBuffer"];
 
 While[True,
   block = DeviceReadBuffer[microphone, 1024];
+
   If[block === $Failed, Break[]];
-  If[block =!= {} && DeviceWriteBuffer[speaker, block] === $Failed, Break[]];
+
+  If[block =!= {} &&
+     DeviceWriteBuffer[speaker, block] === $Failed,
+    Break[]
+  ];
+
   Pause[0.005]
 ];
 
@@ -178,7 +189,6 @@ Type: Input
 microphone = DeviceOpen["Microphone", <|"Channels"->1|>];
 speaker = DeviceOpen["Speaker", <|
   "SampleRate" -> microphone["SampleRate"],
-  "Channels" -> microphone["Channels"],
   "BufferDuration" -> .25
 |>];
 
@@ -188,9 +198,12 @@ Type: Input
 processBlock[_, "BufferReady", {availableFrames_}] := Module[{block},
   block = DeviceReadBuffer[microphone, Min[availableFrames, 256]];
   If[block =!= $Failed && block =!= {},
-    DeviceWriteBuffer[speaker, block]
+    DeviceWriteBuffer[speaker, block];
   ]
 ];
+
+DeviceExecute[speaker, "ClearBuffer"]
+DeviceExecute[microphone, "ClearBuffer"]
 
 task = DeviceExecuteAsynchronous[
   microphone,
@@ -199,8 +212,15 @@ task = DeviceExecuteAsynchronous[
   processBlock
 ];
 
-DeviceExecute[speaker, "ClearBuffer"]
-DeviceExecute[microphone, "ClearBuffer"]
+%-------------------------------------------------------------------------%
+Type: Output
+%-------------------------------------------------------------------------%
+0
+
+%-------------------------------------------------------------------------%
+Type: Output
+%-------------------------------------------------------------------------%
+0
 
 %-------------------------------------------------------------------------%
 Props:
@@ -234,6 +254,11 @@ Display: markdown
 Type: Output
 %-------------------------------------------------------------------------%
 Basic ping-pong delay effect:
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+wetMix = 0.55;
 
 %-------------------------------------------------------------------------%
 Type: Input

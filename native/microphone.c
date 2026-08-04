@@ -16,6 +16,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include "microphone_helper_protocol.h"
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
+
 #if defined(_MSC_VER)
 #define MIC_THREAD_LOCAL __declspec(thread)
 #else
@@ -45,6 +59,21 @@ typedef struct MicrophoneDevice {
     ma_uint32 channels;
     ma_uint32 buffer_frames;
     ma_atomic_uint64 dropped_frames;
+#if defined(__APPLE__)
+    pid_t helper_pid;
+    int helper_audio_fd;
+    int helper_control_fd;
+    int helper_status_fd;
+    pthread_t helper_reader_thread;
+    ma_bool32 helper_thread_started;
+    ma_bool32 helper_running;
+    ma_atomic_uint64 helper_frames_received;
+    ma_uint32 helper_period_frames;
+    ma_uint32 helper_internal_sample_rate;
+    ma_uint32 helper_internal_channels;
+    ma_uint32 helper_internal_format;
+    char helper_device_name[MICROPHONE_HELPER_NAME_CAPACITY];
+#endif
     ma_event async_event;
     ma_event async_stopped_event;
     ma_bool32 async_events_initialized;
@@ -200,12 +229,13 @@ static void uninitialize_async_state(MicrophoneDevice* microphone)
     microphone->async_events_initialized = MA_FALSE;
 }
 
-static void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count)
+static void store_captured_frames(
+    MicrophoneDevice* microphone,
+    const float* input,
+    ma_uint32 frame_count)
 {
-    MicrophoneDevice* microphone = (MicrophoneDevice*)device->pUserData;
     ma_uint32 written = 0;
 
-    (void)output;
     if (microphone == NULL || input == NULL || !microphone->ring_initialized) {
         return;
     }
@@ -235,12 +265,260 @@ static void capture_callback(ma_device* device, void* output, const void* input,
     update_async_notification(microphone);
 }
 
+static void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count)
+{
+    (void)output;
+    store_captured_frames(
+        (MicrophoneDevice*)device->pUserData,
+        (const float*)input,
+        frame_count);
+}
+
+#if defined(__APPLE__)
+static int read_all(int descriptor, void* data, size_t size)
+{
+    unsigned char* cursor = (unsigned char*)data;
+    while (size > 0) {
+        ssize_t count = read(descriptor, cursor, size);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return -1;
+        }
+        cursor += (size_t)count;
+        size -= (size_t)count;
+    }
+    return 0;
+}
+
+static int helper_send_command(MicrophoneDevice* microphone, unsigned char command)
+{
+    ssize_t count;
+    MicrophoneHelperResponse response;
+    ma_uint32 wait_milliseconds = 0;
+    do {
+        count = write(microphone->helper_control_fd, &command, 1);
+    } while (count < 0 && errno == EINTR);
+    if (count != 1 || read_all(
+            microphone->helper_status_fd,
+            &response,
+            sizeof(response)) != 0 ||
+        response.magic != MICROPHONE_HELPER_MAGIC ||
+        response.command != command) {
+        return -1;
+    }
+    if (command == 'S') {
+        while (ma_atomic_uint64_get(&microphone->helper_frames_received) < response.frames_sent) {
+            if (wait_milliseconds++ >= 5000) {
+                return -1;
+            }
+            ma_sleep(1);
+        }
+    }
+    return 0;
+}
+
+static void* helper_reader(void* user_data)
+{
+    MicrophoneDevice* microphone = (MicrophoneDevice*)user_data;
+    unsigned char buffer[65536 + (MIC_MAX_CHANNELS * sizeof(float))];
+    size_t buffered_bytes = 0;
+    size_t bytes_per_frame = (size_t)microphone->channels * sizeof(float);
+
+    while (bytes_per_frame > 0) {
+        ssize_t count = read(
+            microphone->helper_audio_fd,
+            buffer + buffered_bytes,
+            sizeof(buffer) - buffered_bytes);
+        size_t complete_bytes;
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            break;
+        }
+        buffered_bytes += (size_t)count;
+        complete_bytes = (buffered_bytes / bytes_per_frame) * bytes_per_frame;
+        if (complete_bytes > 0) {
+            store_captured_frames(
+                microphone,
+                (const float*)buffer,
+                (ma_uint32)(complete_bytes / bytes_per_frame));
+            ma_atomic_uint64_fetch_add(
+                &microphone->helper_frames_received,
+                (ma_uint64)(complete_bytes / bytes_per_frame));
+            buffered_bytes -= complete_bytes;
+            if (buffered_bytes > 0) {
+                memmove(buffer, buffer + complete_bytes, buffered_bytes);
+            }
+        }
+    }
+    microphone->helper_running = MA_FALSE;
+    return NULL;
+}
+
+static ma_result resolve_helper_path(char* path, size_t capacity)
+{
+    Dl_info info;
+    char* separator;
+    size_t directory_length;
+    const char* helper_name = "microphone_helper";
+
+    if (dladdr((const void*)&resolve_helper_path, &info) == 0 || info.dli_fname == NULL) {
+        return MA_DOES_NOT_EXIST;
+    }
+    separator = strrchr(info.dli_fname, '/');
+    if (separator == NULL) {
+        return MA_DOES_NOT_EXIST;
+    }
+    directory_length = (size_t)(separator - info.dli_fname + 1);
+    if (directory_length + strlen(helper_name) + 1 > capacity) {
+        return MA_PATH_TOO_LONG;
+    }
+    memcpy(path, info.dli_fname, directory_length);
+    strcpy(path + directory_length, helper_name);
+    return access(path, X_OK) == 0 ? MA_SUCCESS : MA_DOES_NOT_EXIST;
+}
+
+static ma_result start_helper_process(
+    MicrophoneDevice* microphone,
+    ma_uint32 sample_rate,
+    ma_uint32 channels,
+    ma_uint32 period_frames,
+    mint profile)
+{
+    char helper_path[PATH_MAX];
+    char sample_rate_text[16];
+    char channels_text[16];
+    char period_text[16];
+    char profile_text[16];
+    char* arguments[6];
+    int audio_pipe[2] = {-1, -1};
+    int control_pipe[2] = {-1, -1};
+    int status_pipe[2] = {-1, -1};
+    posix_spawn_file_actions_t actions;
+    MicrophoneHelperHeader header;
+    int spawn_result;
+
+    if (resolve_helper_path(helper_path, sizeof(helper_path)) != MA_SUCCESS) {
+        return MA_DOES_NOT_EXIST;
+    }
+    snprintf(sample_rate_text, sizeof(sample_rate_text), "%u", sample_rate);
+    snprintf(channels_text, sizeof(channels_text), "%u", channels);
+    snprintf(period_text, sizeof(period_text), "%u", period_frames);
+    snprintf(profile_text, sizeof(profile_text), "%d", profile == 0 ? 0 : 1);
+    arguments[0] = helper_path;
+    arguments[1] = sample_rate_text;
+    arguments[2] = channels_text;
+    arguments[3] = period_text;
+    arguments[4] = profile_text;
+    arguments[5] = NULL;
+
+    if (pipe(audio_pipe) != 0 || pipe(control_pipe) != 0 || pipe(status_pipe) != 0) {
+        if (audio_pipe[0] >= 0) close(audio_pipe[0]);
+        if (audio_pipe[1] >= 0) close(audio_pipe[1]);
+        if (control_pipe[0] >= 0) close(control_pipe[0]);
+        if (control_pipe[1] >= 0) close(control_pipe[1]);
+        if (status_pipe[0] >= 0) close(status_pipe[0]);
+        if (status_pipe[1] >= 0) close(status_pipe[1]);
+        return MA_ERROR;
+    }
+
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, audio_pipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, control_pipe[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, status_pipe[1], MICROPHONE_HELPER_STATUS_FD);
+    posix_spawn_file_actions_addclose(&actions, audio_pipe[0]);
+    posix_spawn_file_actions_addclose(&actions, control_pipe[1]);
+    posix_spawn_file_actions_addclose(&actions, status_pipe[0]);
+    spawn_result = posix_spawn(
+        &microphone->helper_pid,
+        helper_path,
+        &actions,
+        NULL,
+        arguments,
+        environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(audio_pipe[1]);
+    close(control_pipe[0]);
+    close(status_pipe[1]);
+    if (spawn_result != 0) {
+        close(audio_pipe[0]);
+        close(control_pipe[1]);
+        close(status_pipe[0]);
+        microphone->helper_pid = 0;
+        return MA_ERROR;
+    }
+
+    microphone->helper_audio_fd = audio_pipe[0];
+    microphone->helper_control_fd = control_pipe[1];
+    microphone->helper_status_fd = status_pipe[0];
+#if defined(F_SETNOSIGPIPE)
+    {
+        int enabled = 1;
+        (void)fcntl(microphone->helper_control_fd, F_SETNOSIGPIPE, enabled);
+    }
+#endif
+    if (read_all(microphone->helper_status_fd, &header, sizeof(header)) != 0 ||
+        header.magic != MICROPHONE_HELPER_MAGIC ||
+        header.sample_rate == 0 ||
+        header.channels == 0 ||
+        header.channels > MIC_MAX_CHANNELS) {
+        (void)kill(microphone->helper_pid, SIGTERM);
+        close(microphone->helper_audio_fd);
+        close(microphone->helper_control_fd);
+        close(microphone->helper_status_fd);
+        (void)waitpid(microphone->helper_pid, NULL, 0);
+        microphone->helper_pid = 0;
+        return MA_ERROR;
+    }
+
+    microphone->sample_rate = header.sample_rate;
+    microphone->channels = header.channels;
+    microphone->helper_period_frames = header.period_frames;
+    microphone->helper_internal_sample_rate = header.internal_sample_rate;
+    microphone->helper_internal_channels = header.internal_channels;
+    microphone->helper_internal_format = header.internal_format;
+    memcpy(microphone->helper_device_name, header.device_name, sizeof(header.device_name));
+    microphone->helper_device_name[sizeof(microphone->helper_device_name) - 1] = '\0';
+    ma_atomic_uint64_set(&microphone->helper_frames_received, 0);
+    microphone->helper_running = MA_TRUE;
+    return MA_SUCCESS;
+}
+
+static void shutdown_helper_process(MicrophoneDevice* microphone)
+{
+    if (microphone->helper_pid > 0) {
+        (void)helper_send_command(microphone, 'Q');
+        close(microphone->helper_control_fd);
+        microphone->helper_control_fd = -1;
+        close(microphone->helper_status_fd);
+        microphone->helper_status_fd = -1;
+        if (microphone->helper_thread_started) {
+            (void)pthread_join(microphone->helper_reader_thread, NULL);
+            microphone->helper_thread_started = MA_FALSE;
+        } else if (microphone->helper_audio_fd >= 0) {
+            close(microphone->helper_audio_fd);
+        }
+        microphone->helper_audio_fd = -1;
+        (void)waitpid(microphone->helper_pid, NULL, 0);
+        microphone->helper_pid = 0;
+    }
+    microphone->helper_running = MA_FALSE;
+}
+#endif
+
 static void shutdown_device(MicrophoneDevice* microphone)
 {
+#if defined(__APPLE__)
+    shutdown_helper_process(microphone);
+#else
     if (microphone->device_initialized) {
         ma_device_uninit(&microphone->device);
         microphone->device_initialized = MA_FALSE;
     }
+#endif
     if (microphone->ring_initialized) {
         ma_pcm_rb_uninit(&microphone->ring);
         microphone->ring_initialized = MA_FALSE;
@@ -275,7 +553,9 @@ static ma_result start_device(MicrophoneDevice* microphone,
                               ma_uint32 period_frames,
                               mint profile)
 {
+#if !defined(__APPLE__)
     ma_device_config config;
+#endif
     ma_result result;
     uint64_t buffer_frames_64;
 
@@ -284,6 +564,12 @@ static ma_result start_device(MicrophoneDevice* microphone,
         return result;
     }
 
+#if defined(__APPLE__)
+    result = start_helper_process(microphone, sample_rate, channels, period_frames, profile);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+#else
     config = ma_device_config_init(ma_device_type_capture);
     config.capture.format = ma_format_f32;
     config.capture.channels = channels;
@@ -303,6 +589,7 @@ static ma_result start_device(MicrophoneDevice* microphone,
     microphone->device_initialized = MA_TRUE;
     microphone->sample_rate = microphone->device.sampleRate;
     microphone->channels = microphone->device.capture.channels;
+#endif
 
     buffer_frames_64 = ((uint64_t)microphone->sample_rate * buffer_ms + 999U) / 1000U;
     if (buffer_frames_64 == 0 || buffer_frames_64 > UINT32_MAX) {
@@ -324,17 +611,27 @@ static ma_result start_device(MicrophoneDevice* microphone,
     microphone->buffer_frames = ma_pcm_rb_get_subbuffer_size(&microphone->ring);
     ma_atomic_uint64_set(&microphone->dropped_frames, 0);
 
+#if defined(__APPLE__)
+    if (pthread_create(&microphone->helper_reader_thread, NULL, helper_reader, microphone) != 0) {
+        shutdown_device(microphone);
+        return MA_ERROR;
+    }
+    microphone->helper_thread_started = MA_TRUE;
+#else
     result = ma_device_start(&microphone->device);
     if (result != MA_SUCCESS) {
         shutdown_device(microphone);
         return result;
     }
+#endif
 
     microphone->requested_sample_rate = sample_rate;
     microphone->requested_channels = channels;
     microphone->buffer_ms = buffer_ms;
     microphone->requested_period_frames = period_frames;
-    microphone->performance_profile = config.performanceProfile;
+    microphone->performance_profile = profile == 0
+        ? ma_performance_profile_low_latency
+        : ma_performance_profile_conservative;
     microphone->last_error = MA_SUCCESS;
     return MA_SUCCESS;
 }
@@ -730,11 +1027,35 @@ DLLEXPORT int microphoneGetInteger(WolframLibraryData library_data, mint argumen
             case 2: value = (mint)microphone->buffer_frames; break;
             case 3: value = (mint)ma_pcm_rb_available_read(&microphone->ring); break;
             case 4: value = clamp_uint64_to_mint(ma_atomic_uint64_get(&microphone->dropped_frames)); break;
-            case 5: value = (mint)microphone->device.capture.internalPeriodSizeInFrames; break;
-            case 6: value = ma_device_is_started(&microphone->device) ? 1 : 0; break;
+            case 5:
+#if defined(__APPLE__)
+                value = (mint)microphone->helper_period_frames;
+#else
+                value = (mint)microphone->device.capture.internalPeriodSizeInFrames;
+#endif
+                break;
+            case 6:
+#if defined(__APPLE__)
+                value = microphone->helper_running ? 1 : 0;
+#else
+                value = ma_device_is_started(&microphone->device) ? 1 : 0;
+#endif
+                break;
             case 7: value = microphone->performance_profile == ma_performance_profile_conservative ? 1 : 0; break;
-            case 8: value = (mint)microphone->device.capture.internalSampleRate; break;
-            case 9: value = (mint)microphone->device.capture.internalChannels; break;
+            case 8:
+#if defined(__APPLE__)
+                value = (mint)microphone->helper_internal_sample_rate;
+#else
+                value = (mint)microphone->device.capture.internalSampleRate;
+#endif
+                break;
+            case 9:
+#if defined(__APPLE__)
+                value = (mint)microphone->helper_internal_channels;
+#else
+                value = (mint)microphone->device.capture.internalChannels;
+#endif
+                break;
             default: value = -1; break;
         }
     }
@@ -763,6 +1084,9 @@ DLLEXPORT int microphoneGetString(WolframLibraryData library_data, mint argument
     if (microphone != NULL) {
         switch (property) {
             case 0:
+#if defined(__APPLE__)
+                source = microphone->helper_device_name;
+#else
                 if (ma_device_get_name(&microphone->device,
                                        ma_device_type_capture,
                                        g_string_result,
@@ -772,12 +1096,21 @@ DLLEXPORT int microphoneGetString(WolframLibraryData library_data, mint argument
                 } else {
                     source = NULL;
                 }
+#endif
                 break;
             case 1:
+#if defined(__APPLE__)
+                source = "Core Audio";
+#else
                 source = ma_get_backend_name(microphone->device.pContext->backend);
+#endif
                 break;
             case 2:
+#if defined(__APPLE__)
+                source = microphone->helper_running ? "Running" : "Stopped";
+#else
                 source = ma_device_is_started(&microphone->device) ? "Running" : "Stopped";
+#endif
                 break;
             case 3:
                 source = ma_result_description(microphone->last_error);
@@ -835,9 +1168,19 @@ DLLEXPORT int microphoneControl(WolframLibraryData library_data, mint argument_c
     microphone = find_device_unlocked(id);
     if (microphone != NULL) {
         if (command == 0) {
+#if defined(__APPLE__)
+            native_result = helper_send_command(microphone, 'R') == 0 ? MA_SUCCESS : MA_ERROR;
+            if (native_result == MA_SUCCESS) microphone->helper_running = MA_TRUE;
+#else
             native_result = ma_device_start(&microphone->device);
+#endif
         } else if (command == 1) {
+#if defined(__APPLE__)
+            native_result = helper_send_command(microphone, 'S') == 0 ? MA_SUCCESS : MA_ERROR;
+            if (native_result == MA_SUCCESS) microphone->helper_running = MA_FALSE;
+#else
             native_result = ma_device_stop(&microphone->device);
+#endif
         } else if (command == 2) {
             ma_uint32 remaining = ma_pcm_rb_available_read(&microphone->ring);
             native_result = MA_SUCCESS;
