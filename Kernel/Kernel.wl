@@ -10,6 +10,10 @@ DeviceFramework`Devices`Microphone::native =
   "The native audio operation failed: `1`.";
 DeviceFramework`Devices`Microphone::read =
   "The read criterion `1` must be Automatic, All, a non-negative frame count, or a time Quantity.";
+DeviceFramework`Devices`Microphone::async =
+  "The asynchronous buffer threshold `1` must be Automatic or an integer from 1 through `2`.";
+DeviceFramework`Devices`Microphone::asynccmd =
+  "Unknown asynchronous microphone command `1`. Use \"BufferReady\" or \"ReadBuffer\".";
 DeviceFramework`Devices`Microphone::command =
   "Unknown microphone command `1`. Use \"Information\", \"AvailableFrames\", \"ClearBuffer\", \"Start\", or \"Stop\".";
 
@@ -68,6 +72,8 @@ loadNative[] := Module[{library},
         {Integer}, "UTF8String"];
       $nativeControl = LibraryFunctionLoad[library, "microphoneControl",
         {Integer, Integer}, Integer];
+      $nativeStartBufferReadyTask = LibraryFunctionLoad[library,
+        "microphoneStartBufferReadyTask", {Integer, Integer}, Integer];
       True,
       False
     ]]],
@@ -240,9 +246,16 @@ readBuffer[{_, handle_}, criterion_, parameters_: Automatic] := Module[{id, limi
   ];
   id = nativeID[handle];
   available = $nativeGetInteger[id, 3];
-  If[available <= 0 || limit == 0, Return[{}]];
+  If[available < 0,
+    Message[DeviceFramework`Devices`Microphone::native, "the microphone is not available"];
+    Return[$Failed]
+  ];
+  If[available == 0 || limit == 0, Return[{}]];
   frames = If[limit < 0, available, Min[limit, available]];
-  Quiet[Check[$nativeRead[id, frames], $Failed]]
+  Quiet[Check[$nativeRead[id, frames],
+    Message[DeviceFramework`Devices`Microphone::native, "the audio buffer could not be read"];
+    $Failed
+  ]]
 ];
 
 audioFromBuffer[handle_, buffer_] := Module[{dimensions, sampleRate, data},
@@ -325,6 +338,58 @@ execute[_, command_, ___] := (
   $Failed
 );
 
+asyncThreshold[handle_, Automatic] := Module[{period, capacity},
+  period = $nativeGetInteger[nativeID[handle], 5];
+  capacity = $nativeGetInteger[nativeID[handle], 2];
+  If[period > 0 && capacity > 0, Min[period, capacity], $Failed]
+];
+asyncThreshold[_, threshold_Integer?Positive] := threshold;
+asyncThreshold[handle_, parameters_Association] :=
+  asyncThreshold[handle, Lookup[parameters, "MinimumFrames", Automatic]];
+asyncThreshold[_, _] := $Failed;
+
+startBufferReadyTask[handle_, specification_, handler_] := Module[
+  {id, capacity, threshold, task, started},
+  id = nativeID[handle];
+  capacity = $nativeGetInteger[id, 2];
+  threshold = asyncThreshold[handle, specification];
+  If[!IntegerQ[threshold] || threshold < 1 || threshold > capacity,
+    Message[DeviceFramework`Devices`Microphone::async, specification, capacity];
+    Return[$Failed]
+  ];
+  task = Quiet[Check[
+    Internal`CreateAsynchronousTask[
+      $nativeStartBufferReadyTask,
+      {id, threshold},
+      handler,
+      "TaskDetail" -> {"MicrophoneBufferReady", id, threshold}
+    ],
+    $Failed
+  ]];
+  If[Head[task] =!= AsynchronousTaskObject,
+    Message[DeviceFramework`Devices`Microphone::native,
+      "the asynchronous buffer notification could not be started"];
+    Return[$Failed]
+  ];
+  started = Quiet[Check[StartAsynchronousTask[task], $Failed]];
+  If[started === $Failed,
+    Quiet[RemoveAsynchronousTask[task]];
+    Message[DeviceFramework`Devices`Microphone::native,
+      "the asynchronous buffer notification could not be started"];
+    Return[$Failed]
+  ];
+  task
+];
+
+executeAsynchronous[{_, handle_}, command : ("BufferReady" | "ReadBuffer"), handler_] :=
+  startBufferReadyTask[handle, Automatic, handler];
+executeAsynchronous[{_, handle_}, command : ("BufferReady" | "ReadBuffer"), specification_, handler_] :=
+  startBufferReadyTask[handle, specification, handler];
+executeAsynchronous[_, command_, ___] := (
+  Message[DeviceFramework`Devices`Microphone::asynccmd, command];
+  $Failed
+);
+
 microphoneIcon[___] := Graphics[
   {
     Directive[RGBColor[0.18, 0.45, 0.82], Thickness[0.09], CapForm["Round"]],
@@ -347,6 +412,7 @@ DeviceFramework`DeviceClassRegister[
   "ReadFunction" -> read,
   "ReadBufferFunction" -> readBuffer,
   "ExecuteFunction" -> execute,
+  "ExecuteAsynchronousFunction" -> executeAsynchronous,
   "CloseFunction" -> close,
   "Properties" -> Join[
     Normal[$defaultConfiguration],
@@ -358,7 +424,7 @@ DeviceFramework`DeviceClassRegister[
   "DeviceIconFunction" -> microphoneIcon,
   "Singleton" -> True,
   "DeregisterOnClose" -> True,
-  "DriverVersion" -> 0.1
+  "DriverVersion" -> 0.2
 ];
 
 End[];

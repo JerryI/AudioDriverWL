@@ -1,4 +1,5 @@
 #include "WolframLibrary.h"
+#include "WolframIOLibraryFunctions.h"
 #include "WolframNumericArrayLibrary.h"
 
 #define MA_NO_DECODING
@@ -44,8 +45,22 @@ typedef struct MicrophoneDevice {
     ma_uint32 channels;
     ma_uint32 buffer_frames;
     ma_atomic_uint64 dropped_frames;
+    ma_event async_event;
+    ma_event async_stopped_event;
+    ma_bool32 async_events_initialized;
+    ma_atomic_uint32 async_active;
+    ma_atomic_uint32 async_threshold;
+    ma_atomic_uint32 async_available;
+    ma_atomic_uint32 async_pending;
+    mint async_task_id;
+    WolframIOLibrary_Functions async_io_library;
     ma_result last_error;
 } MicrophoneDevice;
+
+typedef struct BufferReadyTaskArguments {
+    MicrophoneDevice* microphone;
+    WolframIOLibrary_Functions io_library;
+} BufferReadyTaskArguments;
 
 static MicrophoneDevice* g_devices[MIC_MAX_DEVICES];
 static ma_mutex g_registry_lock;
@@ -74,6 +89,115 @@ static int find_free_slot_unlocked(void)
         }
     }
     return -1;
+}
+
+static void update_async_notification(MicrophoneDevice* microphone)
+{
+    ma_uint32 available;
+    ma_uint32 threshold;
+
+    if (microphone == NULL ||
+        ma_atomic_uint32_get(&microphone->async_active) == 0 ||
+        !microphone->ring_initialized) {
+        return;
+    }
+
+    threshold = ma_atomic_uint32_get(&microphone->async_threshold);
+    available = ma_pcm_rb_available_read(&microphone->ring);
+    ma_atomic_uint32_set(&microphone->async_available, available);
+
+    if (threshold > 0 && available >= threshold) {
+        if (ma_atomic_uint32_exchange(&microphone->async_pending, 1) == 0) {
+            (void)ma_event_signal(&microphone->async_event);
+        }
+    } else {
+        ma_atomic_uint32_set(&microphone->async_pending, 0);
+    }
+}
+
+static void buffer_ready_task_runner(mint async_task_id, void* user_data)
+{
+    BufferReadyTaskArguments* arguments = (BufferReadyTaskArguments*)user_data;
+    MicrophoneDevice* microphone = arguments->microphone;
+    WolframIOLibrary_Functions io_library = arguments->io_library;
+    DataStore event_data;
+
+    free(arguments);
+    while (io_library->asynchronousTaskAliveQ(async_task_id)) {
+        if (ma_event_wait(&microphone->async_event) != MA_SUCCESS) {
+            break;
+        }
+        if (!io_library->asynchronousTaskAliveQ(async_task_id)) {
+            break;
+        }
+        if (ma_atomic_uint32_get(&microphone->async_active) == 0) {
+            continue;
+        }
+
+        event_data = io_library->createDataStore();
+        if (event_data != NULL) {
+            io_library->DataStore_addInteger(
+                event_data,
+                (mint)ma_atomic_uint32_get(&microphone->async_available));
+            io_library->raiseAsyncEvent(async_task_id, "BufferReady", event_data);
+        }
+    }
+
+    ma_atomic_uint32_set(&microphone->async_active, 0);
+    (void)ma_event_signal(&microphone->async_stopped_event);
+}
+
+static void stop_async_task(MicrophoneDevice* microphone)
+{
+    if (microphone == NULL || microphone->async_task_id <= 0) {
+        return;
+    }
+
+    ma_atomic_uint32_set(&microphone->async_active, 0);
+    ma_atomic_uint32_set(&microphone->async_pending, 0);
+    if (microphone->async_io_library != NULL &&
+        microphone->async_io_library->asynchronousTaskAliveQ(microphone->async_task_id)) {
+        (void)microphone->async_io_library->removeAsynchronousTask(microphone->async_task_id);
+    }
+    (void)ma_event_signal(&microphone->async_event);
+    (void)ma_event_wait(&microphone->async_stopped_event);
+    microphone->async_task_id = 0;
+    microphone->async_io_library = NULL;
+}
+
+static ma_result initialize_async_state(MicrophoneDevice* microphone)
+{
+    ma_result result;
+
+    result = ma_event_init(&microphone->async_event);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+    result = ma_event_init(&microphone->async_stopped_event);
+    if (result != MA_SUCCESS) {
+        ma_event_uninit(&microphone->async_event);
+        return result;
+    }
+
+    microphone->async_events_initialized = MA_TRUE;
+    microphone->async_task_id = 0;
+    microphone->async_io_library = NULL;
+    ma_atomic_uint32_set(&microphone->async_active, 0);
+    ma_atomic_uint32_set(&microphone->async_threshold, 0);
+    ma_atomic_uint32_set(&microphone->async_available, 0);
+    ma_atomic_uint32_set(&microphone->async_pending, 0);
+    return MA_SUCCESS;
+}
+
+static void uninitialize_async_state(MicrophoneDevice* microphone)
+{
+    if (microphone == NULL || !microphone->async_events_initialized) {
+        return;
+    }
+    stop_async_task(microphone);
+    ma_event_uninit(&microphone->async_stopped_event);
+    ma_event_uninit(&microphone->async_event);
+    microphone->async_events_initialized = MA_FALSE;
 }
 
 static void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count)
@@ -108,6 +232,7 @@ static void capture_callback(ma_device* device, void* output, const void* input,
     if (written < frame_count) {
         ma_atomic_uint64_fetch_add(&microphone->dropped_frames, (ma_uint64)(frame_count - written));
     }
+    update_async_notification(microphone);
 }
 
 static void shutdown_device(MicrophoneDevice* microphone)
@@ -228,6 +353,8 @@ static ma_result reconfigure_device(MicrophoneDevice* microphone,
     mint old_profile = microphone->performance_profile == ma_performance_profile_conservative ? 1 : 0;
     ma_result result;
 
+    ma_atomic_uint32_set(&microphone->async_pending, 0);
+    ma_atomic_uint32_set(&microphone->async_available, 0);
     shutdown_device(microphone);
     result = start_device(microphone, sample_rate, channels, buffer_ms, period_frames, profile);
     if (result != MA_SUCCESS) {
@@ -239,8 +366,10 @@ static ma_result reconfigure_device(MicrophoneDevice* microphone,
                            old_period_frames,
                            old_profile);
         microphone->last_error = original_result;
+        update_async_notification(microphone);
         return original_result;
     }
+    update_async_notification(microphone);
     return MA_SUCCESS;
 }
 
@@ -281,6 +410,7 @@ DLLEXPORT void WolframLibrary_uninitialize(WolframLibraryData library_data)
     ma_mutex_lock(&g_registry_lock);
     for (i = 0; i < MIC_MAX_DEVICES; ++i) {
         if (g_devices[i] != NULL) {
+            uninitialize_async_state(g_devices[i]);
             shutdown_device(g_devices[i]);
             free(g_devices[i]);
             g_devices[i] = NULL;
@@ -326,10 +456,19 @@ DLLEXPORT int microphoneOpen(WolframLibraryData library_data, mint argument_coun
         return LIBRARY_NO_ERROR;
     }
 
+    native_result = initialize_async_state(microphone);
+    if (native_result != MA_SUCCESS) {
+        free(microphone);
+        g_last_open_error = native_result;
+        MArgument_setInteger(result, 0);
+        return LIBRARY_NO_ERROR;
+    }
+
     ma_mutex_lock(&g_registry_lock);
     slot = find_free_slot_unlocked();
     if (slot < 0) {
         ma_mutex_unlock(&g_registry_lock);
+        uninitialize_async_state(microphone);
         free(microphone);
         g_last_open_error = MA_TOO_MANY_OPEN_FILES;
         MArgument_setInteger(result, 0);
@@ -348,6 +487,7 @@ DLLEXPORT int microphoneOpen(WolframLibraryData library_data, mint argument_coun
                                  profile);
     if (native_result != MA_SUCCESS) {
         ma_mutex_unlock(&g_registry_lock);
+        uninitialize_async_state(microphone);
         free(microphone);
         g_last_open_error = native_result;
         MArgument_setInteger(result, 0);
@@ -378,6 +518,7 @@ DLLEXPORT int microphoneClose(WolframLibraryData library_data, mint argument_cou
         if (g_devices[i] != NULL && g_devices[i]->id == id) {
             MicrophoneDevice* microphone = g_devices[i];
             g_devices[i] = NULL;
+            uninitialize_async_state(microphone);
             shutdown_device(microphone);
             free(microphone);
             native_result = MA_SUCCESS;
@@ -429,6 +570,70 @@ DLLEXPORT int microphoneConfigure(WolframLibraryData library_data, mint argument
     }
     ma_mutex_unlock(&g_registry_lock);
     MArgument_setInteger(result, (mint)native_result);
+    return LIBRARY_NO_ERROR;
+}
+
+DLLEXPORT int microphoneStartBufferReadyTask(WolframLibraryData library_data,
+                                             mint argument_count,
+                                             MArgument* arguments,
+                                             MArgument result)
+{
+    WolframIOLibrary_Functions io_library = library_data->ioLibraryFunctions;
+    BufferReadyTaskArguments* task_arguments;
+    MicrophoneDevice* microphone;
+    mint id;
+    mint threshold;
+    mint async_task_id = -1;
+
+    if (argument_count != 2 || io_library == NULL) {
+        return LIBRARY_FUNCTION_ERROR;
+    }
+    id = MArgument_getInteger(arguments[0]);
+    threshold = MArgument_getInteger(arguments[1]);
+
+    ma_mutex_lock(&g_registry_lock);
+    microphone = find_device_unlocked(id);
+    if (microphone == NULL ||
+        !microphone->ring_initialized ||
+        !microphone->async_events_initialized ||
+        threshold <= 0 ||
+        (ma_uint64)threshold > microphone->buffer_frames) {
+        ma_mutex_unlock(&g_registry_lock);
+        MArgument_setInteger(result, -1);
+        return LIBRARY_NO_ERROR;
+    }
+
+    stop_async_task(microphone);
+    task_arguments = (BufferReadyTaskArguments*)malloc(sizeof(*task_arguments));
+    if (task_arguments == NULL) {
+        ma_mutex_unlock(&g_registry_lock);
+        MArgument_setInteger(result, -1);
+        return LIBRARY_NO_ERROR;
+    }
+
+    task_arguments->microphone = microphone;
+    task_arguments->io_library = io_library;
+    microphone->async_io_library = io_library;
+    ma_atomic_uint32_set(&microphone->async_threshold, (ma_uint32)threshold);
+    ma_atomic_uint32_set(&microphone->async_available,
+                         ma_pcm_rb_available_read(&microphone->ring));
+    ma_atomic_uint32_set(&microphone->async_pending, 0);
+    ma_atomic_uint32_set(&microphone->async_active, 1);
+
+    async_task_id = io_library->createAsynchronousTaskWithThread(
+        buffer_ready_task_runner,
+        task_arguments);
+    if (async_task_id <= 0) {
+        ma_atomic_uint32_set(&microphone->async_active, 0);
+        microphone->async_io_library = NULL;
+        free(task_arguments);
+    } else {
+        microphone->async_task_id = async_task_id;
+        update_async_notification(microphone);
+    }
+    ma_mutex_unlock(&g_registry_lock);
+
+    MArgument_setInteger(result, async_task_id);
     return LIBRARY_NO_ERROR;
 }
 
@@ -490,6 +695,11 @@ DLLEXPORT int microphoneRead(WolframLibraryData library_data, mint argument_coun
             return LIBRARY_FUNCTION_ERROR;
         }
         frames_read += frames;
+    }
+
+    if (frames_read > 0) {
+        ma_atomic_uint32_set(&microphone->async_pending, 0);
+        update_async_notification(microphone);
     }
 
     MArgument_setMNumericArray(result, array);
@@ -644,6 +854,8 @@ DLLEXPORT int microphoneControl(WolframLibraryData library_data, mint argument_c
                 }
                 remaining -= frames;
             }
+            ma_atomic_uint32_set(&microphone->async_available, 0);
+            ma_atomic_uint32_set(&microphone->async_pending, 0);
         }
         microphone->last_error = native_result;
     }
@@ -651,4 +863,3 @@ DLLEXPORT int microphoneControl(WolframLibraryData library_data, mint argument_c
     MArgument_setInteger(result, (mint)native_result);
     return LIBRARY_NO_ERROR;
 }
-

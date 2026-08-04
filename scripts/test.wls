@@ -37,8 +37,24 @@ If[Head[device] === DeviceObject,
   check["empty buffer", DeviceReadBuffer[device] === {}];
   check["start", DeviceExecute[device, "Start"] === "Running"];
 
+  DeviceExecute[device, "ClearBuffer"];
+  asynchronousEvents = {};
+  asynchronousHandler[_, "BufferReady", {available_}] :=
+    AppendTo[asynchronousEvents, available];
+  asynchronousTask = DeviceExecuteAsynchronous[
+    device, "ReadBuffer", 128, asynchronousHandler];
+  check["asynchronous task object", Head[asynchronousTask] === AsynchronousTaskObject];
+  Pause[.1];
+  check["asynchronous buffer-ready event",
+    Length[asynchronousEvents] === 1 && First[asynchronousEvents] >= 128];
+  If[Head[asynchronousTask] === AsynchronousTaskObject,
+    RemoveAsynchronousTask[asynchronousTask]
+  ];
+  DeviceExecute[device, "ClearBuffer"];
+
   DeviceClose[device];
   check["close", !DeviceOpenQ[device]];
+  check["closed microphone read fails", Quiet[DeviceReadBuffer[device]] === $Failed];
 ];
 
 check["speaker driver registration",
@@ -76,6 +92,8 @@ If[Head[speaker] === DeviceObject,
 
   DeviceClose[speaker];
   check["speaker close", !DeviceOpenQ[speaker]];
+  check["closed speaker write fails",
+    Quiet[DeviceWriteBuffer[speaker, NumericArray[{{0.}}, "Real32"]]] === $Failed];
 ];
 
 If[failures === {},

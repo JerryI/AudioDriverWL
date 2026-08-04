@@ -16,12 +16,14 @@ Props:
 Type: Input
 %-------------------------------------------------------------------------%
 .md
+## Basic operations
 Open the device
 
 %-------------------------------------------------------------------------%
 Display: markdown
 Type: Output
 %-------------------------------------------------------------------------%
+## Basic operations
 Open the device
 
 %-------------------------------------------------------------------------%
@@ -84,7 +86,10 @@ Live refresh (FT)
 %-------------------------------------------------------------------------%
 Type: Input
 %-------------------------------------------------------------------------%
-Refresh[ListLinePlot[Take[Abs@Fourier[DeviceReadBuffer[dev, 4000][[All,1]]//Normal], 200], PlotRange->Full], 0.01]
+Refresh[
+  ListLinePlot[Take[Abs@Fourier[DeviceReadBuffer[dev, 4000][[All,1]]//Normal], 200], PlotRange->Full], 
+  0.01
+]
 
 %-------------------------------------------------------------------------%
 Props:
@@ -104,6 +109,167 @@ Close device
 Type: Input
 %-------------------------------------------------------------------------%
 DeviceClose[dev]
+
+%-------------------------------------------------------------------------%
+Props:
+  Hidden: true
+Type: Input
+%-------------------------------------------------------------------------%
+.md
+## Echo example
+Synchronous version
+
+%-------------------------------------------------------------------------%
+Display: markdown
+Type: Output
+%-------------------------------------------------------------------------%
+## Echo example
+Synchronous version
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+DeviceClose[microphone]
+DeviceClose[speaker]
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+microphone = DeviceOpen["Microphone", <|"Channels"->1|>];
+speaker = DeviceOpen["Speaker", <|
+  "SampleRate" -> microphone["SampleRate"],
+  "Channels" -> microphone["Channels"],
+  "BufferDuration" -> .25
+|>];
+
+DeviceExecute[speaker, "ClearBuffer"]
+DeviceExecute[microphone, "ClearBuffer"]
+
+While[True,
+  block = DeviceReadBuffer[microphone, 1024];
+  If[block === $Failed, Break[]];
+  If[block =!= {} && DeviceWriteBuffer[speaker, block] === $Failed, Break[]];
+  Pause[0.005]
+];
+
+%-------------------------------------------------------------------------%
+Props:
+  Hidden: true
+Type: Input
+%-------------------------------------------------------------------------%
+.md
+Async version (event-driven)
+
+%-------------------------------------------------------------------------%
+Display: markdown
+Type: Output
+%-------------------------------------------------------------------------%
+Async version (event-driven)
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+DeviceClose[microphone]
+DeviceClose[speaker]
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+microphone = DeviceOpen["Microphone", <|"Channels"->1|>];
+speaker = DeviceOpen["Speaker", <|
+  "SampleRate" -> microphone["SampleRate"],
+  "Channels" -> microphone["Channels"],
+  "BufferDuration" -> .25
+|>];
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+processBlock[_, "BufferReady", {availableFrames_}] := Module[{block},
+  block = DeviceReadBuffer[microphone, Min[availableFrames, 256]];
+  If[block =!= $Failed && block =!= {},
+    DeviceWriteBuffer[speaker, block]
+  ]
+];
+
+task = DeviceExecuteAsynchronous[
+  microphone,
+  "ReadBuffer",                 (* "BufferReady" is an equivalent alias *)
+  256,                          (* minimum buffered frames *)
+  processBlock
+];
+
+DeviceExecute[speaker, "ClearBuffer"]
+DeviceExecute[microphone, "ClearBuffer"]
+
+%-------------------------------------------------------------------------%
+Props:
+  Hidden: true
+Type: Input
+%-------------------------------------------------------------------------%
+.md
+To stop
+
+%-------------------------------------------------------------------------%
+Display: markdown
+Type: Output
+%-------------------------------------------------------------------------%
+To stop
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+RemoveAsynchronousTask[task]
+
+%-------------------------------------------------------------------------%
+Props:
+  Hidden: true
+Type: Input
+%-------------------------------------------------------------------------%
+.md
+Basic ping-pong delay effect:
+
+%-------------------------------------------------------------------------%
+Display: markdown
+Type: Output
+%-------------------------------------------------------------------------%
+Basic ping-pong delay effect:
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+sampleRate = microphone["SampleRate"];
+delayTime = 0.375;
+delaySamples = Round[delayTime*sampleRate];
+feedback = 0.45;
+wetMix = 0.35;
+
+buffer = ConstantArray[0., delaySamples];
+writePos = 1;
+
+processBlock[_, "BufferReady", {availableFrames_}] := Module[
+  {block, flat, n, out, inSample, readVal},
+  block = DeviceReadBuffer[microphone, Min[availableFrames, 256]];
+  If[block === $Failed || block === {}, Return[]];
+  
+  flat = Flatten[Normal[block]];   (* {N,1} -> flat list of N scalars *)
+  n = Length[flat];
+  out = ConstantArray[0., n];
+  
+  Do[
+   inSample = flat[[i]];
+   readVal = buffer[[writePos]];
+
+   buffer[[writePos]] = inSample + feedback*readVal;
+   out[[i]] = Clip[inSample + wetMix*readVal, {-1, 1}];
+
+   writePos++;
+   If[writePos > delaySamples, writePos = 1];
+   , {i, 1, n}];
+  
+  (* reshape back to {N,1} to match what the mono speaker expects *)
+  DeviceWriteBuffer[speaker, NumericArray[Partition[out, 1], "Real32"]]
+];
 
 %------------------------------%EndOfCells%-------------------------------%
 

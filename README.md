@@ -66,8 +66,11 @@ DeviceExecute[speaker, "Stop"]
 DeviceExecute[speaker, "Start"]
 ```
 
-For a low-latency microphone-to-speaker stream, open both devices with the
-microphone's negotiated format and move each available raw block directly:
+### Synchronous live echo
+
+For a low-latency synchronous microphone-to-speaker stream, open both devices
+with the microphone's negotiated format and move each available raw block
+directly. The short `Pause[0.005]` avoids a CPU-intensive tight loop:
 
 ```wl
 microphone = DeviceOpen["Microphone"];
@@ -77,16 +80,52 @@ speaker = DeviceOpen["Speaker", <|
   "BufferDuration" -> .25
 |>];
 
-While[DeviceOpenQ[microphone] && DeviceOpenQ[speaker],
+While[True,
   block = DeviceReadBuffer[microphone, 1024];
-  If[block =!= {}, DeviceWriteBuffer[speaker, block]];
-  Pause[.005]
+  If[block === $Failed, Break[]];
+  If[block =!= {} && DeviceWriteBuffer[speaker, block] === $Failed, Break[]];
+  Pause[0.005]
 ];
 ```
 
 Use headphones for this example; an open microphone and nearby loudspeakers
 can create acoustic feedback. For continuous streaming, keep each block below
 `speaker["FreeFrames"]` or monitor `"DroppedFrames"`.
+
+### Asynchronous live echo
+
+The microphone can notify Wolfram when a complete block is available through
+the Device Framework's asynchronous command API. This keeps all synchronous
+`DeviceRead` and `DeviceReadBuffer` forms available and removes the need for a
+scheduled polling task:
+
+```wl
+processBlock[_, "BufferReady", {availableFrames_}] := Module[{block},
+  block = DeviceReadBuffer[microphone, Min[availableFrames, 256]];
+  If[block =!= $Failed && block =!= {},
+    DeviceWriteBuffer[speaker, block]
+  ]
+];
+
+task = DeviceExecuteAsynchronous[
+  microphone,
+  "ReadBuffer",                 (* "BufferReady" is an equivalent alias *)
+  256,                          (* minimum buffered frames *)
+  processBlock
+];
+
+RemoveAsynchronousTask[task];
+```
+
+The threshold can also be supplied as
+`<|"MinimumFrames" -> 256|>`. With no threshold, the native input period is
+used. The audio callback only signals a sleeping native notification thread;
+the Wolfram handler runs later on the kernel's event queue. Notifications are
+coalesced until the handler consumes frames, so an unhandled event does not
+produce an ever-growing event backlog.
+
+An empty, healthy input buffer still returns `{}`. Actual native read or write
+failures return `$Failed`; no separate readiness predicate is required.
 
 ## Prebuild binaries
 ⚠️ We need some time to collect binaries for all machines
