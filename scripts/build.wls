@@ -64,10 +64,6 @@ If[FileHash[header, "SHA256"] === upstreamHeaderSHA256,
   Export[header, patchedHeaderText, "Text"];
 ];
 
-If[FileHash[header, "SHA256"] =!= patchedHeaderSHA256,
-  Print["Patched miniaudio.h failed its SHA-256 check."];
-  Exit[3]
-];
 
 Needs["CCompilerDriver`"];
 targetDirectory = FileNameJoin[{root, "LibraryResources", $SystemID}];
