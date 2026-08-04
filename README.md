@@ -131,7 +131,7 @@ failures return `$Failed`; no separate readiness predicate is required.
 ⚠️ We need some time to collect binaries for all machines
 - [x] MacOS Apple Silicon
 - [ ] MacOS x64
-- [ ] Windows x64
+- [x] Windows x64
 - [ ] GNU/Linux x64
 - [ ] GNU/Linux ARM64  
 
