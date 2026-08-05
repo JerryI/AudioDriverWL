@@ -3,6 +3,10 @@
 This paclet exposes the operating system's default audio input and output as
 Wolfram Device Framework devices.
 
+> C part was not written by me. All credits to Joshua Leroy & Miniaudio.
+
+⚠️ Requires Wolfram Kernel > 14.3
+
 ## Microphone
 
 ```wl
