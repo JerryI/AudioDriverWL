@@ -139,6 +139,44 @@ produce an ever-growing event backlog.
 An empty, healthy input buffer still returns `{}`. Actual native read or write
 failures return `$Failed`; no separate readiness predicate is required.
 
+### Ping-pong delay effect
+This can be effectively used as a guitar pedal emulation:
+
+```wolfram
+sampleRate = microphone["SampleRate"];
+delayTime = 0.375;
+delaySamples = Round[delayTime*sampleRate];
+feedback = 0.45;
+wetMix = 0.35;
+
+buffer = ConstantArray[0., delaySamples];
+writePos = 1;
+
+processBlock[_, "BufferReady", {availableFrames_}] := Module[
+  {block, flat, n, out, inSample, readVal},
+  block = DeviceReadBuffer[microphone, Min[availableFrames, 256]];
+  If[block === $Failed || block === {}, Return[]];
+  
+  flat = Flatten[Normal[block]];   (* {N,1} -> flat list of N scalars *)
+  n = Length[flat];
+  out = ConstantArray[0., n];
+  
+  Do[
+   inSample = flat[[i]];
+   readVal = buffer[[writePos]];
+
+   buffer[[writePos]] = inSample + feedback*readVal;
+   out[[i]] = Clip[inSample + wetMix*readVal, {-1, 1}];
+
+   writePos++;
+   If[writePos > delaySamples, writePos = 1];
+   , {i, 1, n}];
+  
+  (* reshape back to {N,1} to match what the mono speaker expects *)
+  DeviceWriteBuffer[speaker, NumericArray[Partition[out, 1], "Real32"]]
+];
+```
+
 ## Prebuild binaries
 ⚠️ We need some time to collect binaries for all machines
 - [x] MacOS Apple Silicon

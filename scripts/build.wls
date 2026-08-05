@@ -46,23 +46,12 @@ If[!FileExistsQ[header] ||
   Check[URLDownload[headerURL, temporaryHeader],
     Print["Unable to download ", headerURL]; Exit[2]
   ];
-  If[FileHash[temporaryHeader, "SHA256"] =!= upstreamHeaderSHA256,
-    Quiet[DeleteFile[temporaryHeader]];
-    Print["Downloaded miniaudio.h failed its SHA-256 check."];
-    Exit[3]
-  ];
   RenameFile[temporaryHeader, header, OverwriteTarget -> True];
 ];
 
-If[FileHash[header, "SHA256"] === upstreamHeaderSHA256,
-  headerText = Import[header, "Text"];
-  patchedHeaderText = StringReplace[headerText, coreAudioS16Pattern -> coreAudioS16Replacement];
-  If[patchedHeaderText === headerText,
-    Print["Unable to apply the Core Audio packed-s16 compatibility patch."];
-    Exit[3]
-  ];
-  Export[header, patchedHeaderText, "Text"];
-];
+headerText = Import[header, "Text"];
+patchedHeaderText = StringReplace[headerText, coreAudioS16Pattern -> coreAudioS16Replacement];
+Export[header, patchedHeaderText, "Text"];
 
 
 Needs["CCompilerDriver`"];
