@@ -1,0 +1,171 @@
+%-------------------------------%Notebook%--------------------------------%
+HaveToSaveAs: false
+ObjectFields:
+  - Objects
+  - Symbols
+Quick: true
+%-------------------------------------------------------------------------%
+
+
+%---------------------------------%Cells%---------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+micSampleRate = dev["SampleRate"];
+FrequencyAxis[n_, nTake_] := N@Range[0, nTake - 1] (micSampleRate/n)
+ClearAll[findPeaks, FreqToNote];
+findPeaks[spectrum_List, freqAxis_List, threshold_: Automatic] :=
+ With[{peakPositions = FindPeaks[spectrum, Automatic, Automatic, threshold]},
+  If[peakPositions === {},
+   {10., 0.},
+   First@MaximalBy[
+     Map[Function[q, {freqAxis[[q[[1]]]], q[[2]]}], peakPositions],
+     Last]
+   ]
+  ]
+
+noteNames = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+FreqToNote[freq_] := FreqToNote[10.0];
+FreqToNote[freq_?NumberQ] := Module[{midi, noteIdx, octave, cents},
+  midi = 69 + 12*Log2[Max[freq, 10.]/440.];
+  noteIdx = Mod[Round[midi], 12] + 1;
+  octave = Quotient[Round[midi], 12] - 1;
+  cents = Round[(midi - Round[midi])*100];
+  <|"Note" -> noteNames[[noteIdx]] <> ToString[octave],
+    "Cents" -> cents,
+    "Frequency" -> freq|>
+  ]
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+69 - 12 Log2[200/440.]
+
+%-------------------------------------------------------------------------%
+Type: Output
+%-------------------------------------------------------------------------%
+82.65004228499922`
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+FreqToNote[0.01]
+
+%-------------------------------------------------------------------------%
+Type: Output
+%-------------------------------------------------------------------------%
+<|"Note"->"E-11","Cents"->-10,"Frequency"->0.01`|>
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+DeviceExecute[dev, "ClearBuffer"];
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+windowLength =  3 1024;
+buffer = Table[0., {windowLength}];
+window = Array[HammingWindow, windowLength, {-1/2, 1/2}];
+
+DeviceExecute[dev, "ClearBuffer"];
+With[{xAxis = FrequencyAxis[windowLength,500]}, Refresh[
+  If[dev["AvailableFrames"] >= windowLength,
+    buffer = Take[DeviceReadBuffer[dev][[All,1]]//Normal,-windowLength];
+  ];
+  With[{spectrum = Clip[Take[Abs@Fourier[window buffer], 500], {0,1.9}]},
+    Graphics[Line@Transpose[{xAxis, spectrum}], Axes->True, PlotRange->{{0,1500}, {0,2.0}}]
+  ], 1/60.0]
+]
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+windowLength =  3 1024;
+buffer = Table[0., {windowLength}];
+window = Array[HammingWindow, windowLength, {-1/2, 1/2}];
+
+DeviceExecute[dev, "ClearBuffer"];
+With[{xAxis = FrequencyAxis[windowLength,500]}, Refresh[
+  If[dev["AvailableFrames"] >= windowLength,
+    buffer = Take[DeviceReadBuffer[dev][[All,1]]//Normal,-windowLength];
+  ];
+  With[{spectrum = Clip[Take[Abs@Fourier[window buffer], 500], {0,1.0}]}, {
+    peak = findPeaks[spectrum, xAxis]
+  }, {
+    note = FreqToNote[peak[[1]]]
+  },
+
+    Graphics[{
+      Line@Transpose[{xAxis, spectrum}],
+      Red, Translate[Text[note["Note"], peak, {0,0}], Offset[{0,-15}]]
+    }, Axes->True, PlotRange->{{0,1500}, {0,1.2}}]
+  ], 1/60.0]
+]
+
+%-------------------------------------------------------------------------%
+Type: Output
+%-------------------------------------------------------------------------%
+(*VB[*)(Null)(*,*)(*"1:eJyVkF1LwzAYhav4jf4IYbeFtWtrC16IMpnoGLSit03NSRsIzcwH1r80/6RpdYrKLszF4byHJ8nLOa1kzrY8z9M7TmZSUNYbfeQkB1PQzaXs2N46m1JupHrgePm4te9kwZiQhOrU+SvJGHDHny2sKqedQau5bHU5Jy1fWkEMypvWQLVElNqo0SSMw7M4YNvrHXIrUBwM3xO6aMXrkN4ri5/MsE4BgSdDKjfuuvGaCP0LKw773AqRQ8NseKs4ceYWWM5JNwOvm43g8Tf4yKlpvrhi5ExGEREWpD6yMPAjFmZ+FaexP0kQJkjGERCpt1V/xhd/Czz/b4FG8brGZ4lJ9A4dJn3S"*)(*]VB*)
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+
+
+%-------------------------------------------------------------------------%
+Type: Input
+%-------------------------------------------------------------------------%
+findPeaks[{0,0,0,0,0}, {1,2,3,4,5,6}]
+
+%-------------------------------------------------------------------------%
+Type: Output
+%-------------------------------------------------------------------------%
+{}
+
+%------------------------------%EndOfCells%-------------------------------%
+
+
+
+%--------------------------------%Objects%--------------------------------%
+%-----------------------------%EndOfObjects%------------------------------%
+
+
+
+%--------------------------------%Symbols%--------------------------------%
+Key: CoffeeLiqueur`Extensions`Manipulate`Internal`trigger$3252764
+%-------------------------------------------------------------------------%
+0
+
+%-------------------------------------------------------------------------%
+Key: CoffeeLiqueur`Extensions`Manipulate`Internal`str$3252751
+%-------------------------------------------------------------------------%
+"(*VB[*)(Graphics[{Line[Offload[cmpled174]], RGBColor[1, 0, 0], Translate[Text[Offload[cmpled173[[1]]], Offload[cmpled173[[2]]], {0, 0}], Offload[cmpled172]]}, Axes -> True, PlotRange -> {{0, 1500}, {0, 1.2}}])(*,*)(*\"1:eJxTTMoPSmNkYGAoZgESHvk5KWnMIB4HkHAvSizIyEwuhoiA5H0yi0sQqn0y81IhPHYg4Z+WlpOfmFLMCWQn5xbkpKYYmpsgDAtyd3LOz8kvygRpyGSAEWlMIAUgPSFFiXnFOYklqQjrQlIrSjAsgOgASQckFpWgWGcMNpw0HUxwR8A8iOQ4vJ4zQmgLKs1JBTMcK1KLIU4vKk1FkwfpDcjJLwlKzEtPRbUSmwPusGJ1WJExGHy2BwBlC1fY\"*)(*]VB*)"
+
+%-------------------------------------------------------------------------%
+Key: cmpled174
+%-------------------------------------------------------------------------%
+CoffeeLiqueur`Extensions`FrontendObject`Tools`ExtractJSONCompressed["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"]
+
+%-------------------------------------------------------------------------%
+Key: cmpled172
+%-------------------------------------------------------------------------%
+Offset[JSObject[0[-15]]]
+
+%-------------------------------------------------------------------------%
+Key: cmpled173
+%-------------------------------------------------------------------------%
+CoffeeLiqueur`Extensions`FrontendObject`Tools`ExtractJSON["JTVCJTIyRDIlMjIlMkMlNUI3MS43NzczNDM3NSUyQzAuMjMwNDg3MDE3MDU4NTk3MTclNUQlNUQ="]
+
+%-----------------------------%EndOfSymbols%------------------------------%
+
+
+
+
+
+%-----------------------------%EndOfNotebook%-----------------------------%
