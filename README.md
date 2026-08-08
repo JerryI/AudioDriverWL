@@ -5,8 +5,6 @@ Wolfram Device Framework devices.
 
 > C part was not written by me. All credits to Joshua Leroy & Miniaudio.
 
-⚠️ Requires Wolfram Kernel > 14.3
-
 ## Microphone
 
 ```wl
