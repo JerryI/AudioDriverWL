@@ -9,7 +9,7 @@ PacletObject[
         "Kernel",
         "Root" -> "Kernel",
         "Context" -> {
-            {"DeviceAPI`Drivers`Microphone`", "Kernel.wl"},
+            {"DeviceAPI`Drivers`Microphone`", "Microphone.wl"},
             {"DeviceAPI`Drivers`Speaker`", "Speaker.wl"},
         },
         "Loading" -> "Startup"
