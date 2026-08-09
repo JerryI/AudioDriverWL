@@ -180,10 +180,10 @@ processBlock[_, "BufferReady", {availableFrames_}] := Module[
 ```
 
 ## Prebuild binaries
-- [x] MacOS Apple Silicon
+- [x] MacOS Apple Silicon (WL > 14.3)
 - [ ] MacOS x64
-- [x] Windows x64
-- [x] GNU/Linux x64
+- [x] Windows x64 (WL > 14.3)
+- [x] GNU/Linux x64 (WL > 14.3)
 - [ ] GNU/Linux ARM64  
 
 ## Configuration
